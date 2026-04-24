@@ -47,7 +47,9 @@ func main() {
 		cfg.TypesenseAPIKey,
 	)
 	if err != nil {
-		log.Fatalf("[main] FATAL: could not connect to Typesense: %v", err)
+		// Non-fatal: the geo-hierarchy endpoints don't need Typesense.
+		// /api/v1/search will return 503 until connectivity is restored.
+		log.Printf("[main] WARN: Typesense unavailable (%v) — search endpoint will return 503", err)
 	}
 
 	// ── 5. Instantiate handlers ───────────────────────────────────────────

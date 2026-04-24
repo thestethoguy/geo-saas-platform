@@ -66,6 +66,12 @@ type SearchResponse struct {
 // serves sub-millisecond responses; adding a Redis layer would slow down
 // multi-term prefix searches that change on every keystroke.
 func (h *SearchHandler) Search(w http.ResponseWriter, r *http.Request) {
+	// ── 0. Guard: Typesense may be unavailable at startup ─────────────────
+	if h.ts == nil {
+		writeError(w, http.StatusServiceUnavailable, "search service is currently unavailable — please try again later")
+		return
+	}
+
 	// ── 1. Parse & validate query parameters ─────────────────────────────
 	q := r.URL.Query().Get("q")
 	if q == "" {
