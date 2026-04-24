@@ -1,0 +1,51 @@
+state_lgd_code,state_name,district_lgd_code,district_name,sub_district_lgd_code,sub_district_name,village_lgd_code,village_name,census_code,pincode,latitude,longitude,population
+01,Jammu & Kashmir,001,Anantnag,0001,Anantnag,000001,Achabal,J001,192201,33.7260,75.1590,4500
+01,Jammu & Kashmir,001,Anantnag,0001,Anantnag,000002,Arwah,J002,192201,33.7311,75.1622,1200
+01,Jammu & Kashmir,001,Anantnag,0001,Anantnag,000003,Bandpora Anantnag,J003,192201,33.7190,75.1480,3800
+01,Jammu & Kashmir,001,Anantnag,0002,Bijbehara,000004,Bijbehara Town,J004,192124,33.7420,75.1320,12000
+01,Jammu & Kashmir,001,Anantnag,0002,Bijbehara,000005,Chakura,J005,192124,33.7510,75.1280,980
+01,Jammu & Kashmir,002,Baramulla,0003,Baramulla,000006,Baramulla Town,J006,193101,34.2090,74.3420,35000
+01,Jammu & Kashmir,002,Baramulla,0003,Baramulla,000007,Watergam,J007,193101,34.2150,74.3500,2100
+01,Jammu & Kashmir,002,Baramulla,0004,Sopore,000008,Sopore Town,J008,193201,34.2980,74.4730,55000
+01,Jammu & Kashmir,002,Baramulla,0004,Sopore,000009,Arwani Sopore,J009,193201,34.3010,74.4780,1340
+27,Maharashtra,479,Pune,4791,Haveli,271001,Manjri Khurd,M001,411028,18.5086,73.9632,8900
+27,Maharashtra,479,Pune,4791,Haveli,271002,Manjri Budruk,M002,411028,18.5130,73.9700,5200
+27,Maharashtra,479,Pune,4791,Haveli,271003,Kharadi,M003,411014,18.5533,73.9421,21000
+27,Maharashtra,479,Pune,4791,Haveli,271004,Wagholi,M004,412207,18.5693,73.9810,38000
+27,Maharashtra,479,Pune,4792,Mulshi,271005,Pirangut,M005,412115,18.4920,73.6540,6700
+27,Maharashtra,479,Pune,4792,Mulshi,271006,Lavale,M006,412115,18.5370,73.7260,3100
+27,Maharashtra,479,Pune,4792,Mulshi,271007,Hinjewadi,M007,411057,18.5908,73.7381,15000
+27,Maharashtra,480,Nashik,4801,Nashik,272001,Nashik Road,M008,422101,19.9615,73.8036,28000
+27,Maharashtra,480,Nashik,4801,Nashik,272002,Deolali,M009,422401,19.9479,73.8330,14000
+27,Maharashtra,480,Nashik,4801,Nashik,272003,Satpur,M010,422007,20.0020,73.7700,9500
+27,Maharashtra,480,Nashik,4802,Igatpuri,272004,Igatpuri Town,M011,422403,19.6944,73.5556,12000
+27,Maharashtra,480,Nashik,4802,Igatpuri,272005,Ghoti Budruk,M012,422402,19.7280,73.6130,3400
+29,Karnataka,572,Bengaluru Urban,5721,Bengaluru North,291001,Yelahanka,K001,560064,13.1007,77.5963,45000
+29,Karnataka,572,Bengaluru Urban,5721,Bengaluru North,291002,Jakkur,K002,560064,13.0766,77.5939,7200
+29,Karnataka,572,Bengaluru Urban,5721,Bengaluru North,291003,Hebbal,K003,560024,13.0358,77.5970,32000
+29,Karnataka,572,Bengaluru Urban,5722,Bengaluru South,291004,Begur,K004,560068,12.8832,77.6218,9800
+29,Karnataka,572,Bengaluru Urban,5722,Bengaluru South,291005,Hullimangala,K005,560105,12.8390,77.6490,4100
+29,Karnataka,573,Mysuru,5731,Mysuru,292001,Mysuru City,K006,570001,12.2958,76.6394,920000
+29,Karnataka,573,Mysuru,5731,Mysuru,292002,Siddalingapura,K007,570011,12.2800,76.6530,6300
+29,Karnataka,573,Mysuru,5732,Hunsur,292003,Hunsur Town,K008,571105,12.3059,76.2898,40000
+33,Tamil Nadu,601,Chennai,6011,Ambattur,331001,Ambattur,T001,600053,13.1143,80.1548,115000
+33,Tamil Nadu,601,Chennai,6011,Ambattur,331002,Padi,T002,600050,13.1048,80.1836,28000
+33,Tamil Nadu,601,Chennai,6011,Ambattur,331003,Kolathur,T003,600099,13.1200,80.2110,62000
+33,Tamil Nadu,601,Chennai,6012,Sholinganallur,331004,Sholinganallur,T004,600119,12.9007,80.2275,48000
+33,Tamil Nadu,601,Chennai,6012,Sholinganallur,331005,Perungudi,T005,600096,12.9580,80.2420,17000
+33,Tamil Nadu,602,Coimbatore,6021,Coimbatore North,332001,Coimbatore North,T006,641001,11.0168,76.9558,250000
+33,Tamil Nadu,602,Coimbatore,6021,Coimbatore North,332002,Singanallur,T007,641005,11.0010,77.0140,38000
+33,Tamil Nadu,602,Coimbatore,6022,Mettupalayam,332003,Mettupalayam Town,T008,641301,11.2987,76.9338,52000
+09,Uttar Pradesh,155,Lucknow,1551,Lucknow,091001,Amausi,U001,226009,26.7606,80.8893,12000
+09,Uttar Pradesh,155,Lucknow,1551,Lucknow,091002,Chinhat,U002,226021,26.8840,81.0300,18000
+09,Uttar Pradesh,155,Lucknow,1551,Lucknow,091003,Kakori,U003,226101,26.9290,80.7800,9200
+09,Uttar Pradesh,155,Lucknow,1552,Malihabad,091004,Malihabad Town,U004,227111,26.9190,80.7140,28000
+09,Uttar Pradesh,155,Lucknow,1552,Malihabad,091005,Dewa,U005,225121,26.7070,81.2650,5600
+09,Uttar Pradesh,156,Agra,1561,Agra,092001,Fatehabad,U006,283111,27.1200,77.9930,24000
+09,Uttar Pradesh,156,Agra,1561,Agra,092002,Runkata,U007,282007,27.2270,77.9900,8900
+09,Uttar Pradesh,156,Agra,1562,Kiraoli,092003,Kiraoli Town,U008,283122,27.2650,78.1100,14000
+06,Haryana,061,Gurugram,0611,Gurugram,061001,Sikanderpur,H001,122002,28.4797,77.0761,5300
+06,Haryana,061,Gurugram,0611,Gurugram,061002,Nathupur,H002,122001,28.4680,77.0940,3200
+06,Haryana,061,Gurugram,0611,Gurugram,061003,Chauma,H003,122504,28.3980,77.0210,1800
+06,Haryana,062,Faridabad,0621,Faridabad,062001,Badhkal,H004,121001,28.3898,77.3211,8700
+06,Haryana,062,Faridabad,0621,Faridabad,062002,Pali,H005,121102,28.3400,77.4100,4200

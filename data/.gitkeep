@@ -1,0 +1,7 @@
+# This file keeps the /data directory tracked by Git.
+# Place your LGD CSV/Excel source files here before running the ETL ingestion script.
+# Example files:
+#   - LGD_States.xlsx
+#   - LGD_Districts.xlsx
+#   - LGD_SubDistricts.xlsx
+#   - LGD_Villages.csv

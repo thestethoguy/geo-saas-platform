@@ -1,0 +1,28 @@
+# Git
+.env
+*.env.local
+*.env.production
+
+# Go
+/api/bin/
+/api/vendor/
+*.exe
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker volumes (local dev data)
+postgres_data/
+redis_data/
+typesense_data/
+
+# OS
+.DS_Store
+Thumbs.db

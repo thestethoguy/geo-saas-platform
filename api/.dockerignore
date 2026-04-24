@@ -1,0 +1,20 @@
+# Build artefacts
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+
+# IDE / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Never include local secrets in the Docker build context
+.env
+.env.*
+
+# Git history (not needed inside the image)
+.git/
+.gitignore
