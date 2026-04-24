@@ -99,29 +99,38 @@ func buildPostgresDSN() string {
 // buildTypesenseConfig returns the server URL and API key for Typesense.
 //
 // Priority (highest → lowest):
-//  1. TYPESENSE_URL  – full URL e.g. "http://geo-search:8108" (Render internal / self-hosted)
-//  2. Individual     – TYPESENSE_HOST / TYPESENSE_PORT (with TYPESENSE_API_KEY)
+//  1. TYPESENSE_URL      – full URL incl. scheme, e.g. "https://host:443" (Render / self-hosted)
+//  2. Individual vars    – TYPESENSE_PROTOCOL + TYPESENSE_HOST + TYPESENSE_PORT
+//
+// TYPESENSE_PROTOCOL defaults to "http" for local/docker-compose.
+// Set it to "https" in production when the provider terminates TLS.
 func buildTypesenseConfig() (serverURL string, apiKey string) {
 	apiKey = os.Getenv("TYPESENSE_API_KEY") // explicit — never silently empty
 
-	// 1. Full URL var — preferred in all cloud environments
+	// 1. Full URL var — already carries its own scheme; use verbatim
 	if v := os.Getenv("TYPESENSE_URL"); v != "" {
 		log.Printf("[config] Typesense: using TYPESENSE_URL → %s", v)
 		return v, apiKey
 	}
 
-	// 2. Individual vars — used in local dev / docker-compose
+	// 2. Build from individual vars
+	protocol := os.Getenv("TYPESENSE_PROTOCOL")
+	if protocol == "" {
+		protocol = "http" // safe default for local / docker-compose
+	}
+
 	host := os.Getenv("TYPESENSE_HOST")
 	if host == "" {
 		host = "localhost"
 	}
+
 	port := os.Getenv("TYPESENSE_PORT")
 	if port == "" {
 		port = "8108"
 	}
 
-	built := fmt.Sprintf("http://%s:%s", host, port)
-	log.Printf("[config] Typesense: TYPESENSE_HOST=%q TYPESENSE_PORT=%q → %s", host, port, built)
+	built := fmt.Sprintf("%s://%s:%s", protocol, host, port)
+	log.Printf("[config] Typesense: protocol=%q host=%q port=%q → %s", protocol, host, port, built)
 	return built, apiKey
 }
 
