@@ -24,10 +24,9 @@ type Config struct {
 	RedisAddr     string
 	RedisPassword string
 
-	// Typesense
-	TypesenseHost   string
-	TypesensePort   string
-	TypesenseAPIKey string
+	// Typesense — use TypesenseURL field directly; Host/Port kept for reference
+	TypesenseServerURL string
+	TypesenseAPIKey    string
 }
 
 // Load reads the .env file (if present) and populates Config.
@@ -40,6 +39,7 @@ func Load() *Config {
 	}
 
 	redisAddr, redisPwd := buildRedisConfig()
+	tsURL, tsKey := buildTypesenseConfig()
 
 	cfg := &Config{
 		AppPort:  getEnv("APP_PORT", "8080"),
@@ -51,17 +51,17 @@ func Load() *Config {
 		RedisAddr:     redisAddr,
 		RedisPassword: redisPwd,
 
-		TypesenseHost:   getEnv("TYPESENSE_HOST", "localhost"),
-		TypesensePort:   getEnv("TYPESENSE_PORT", "8108"),
-		TypesenseAPIKey: getEnv("TYPESENSE_API_KEY", ""),
+		TypesenseServerURL: tsURL,
+		TypesenseAPIKey:    tsKey,
 	}
 
 	return cfg
 }
 
-// TypesenseURL returns the base URL for the Typesense server.
+// TypesenseURL returns the resolved Typesense server URL.
+// Use this instead of building the URL manually.
 func (c *Config) TypesenseURL() string {
-	return fmt.Sprintf("http://%s:%s", c.TypesenseHost, c.TypesensePort)
+	return c.TypesenseServerURL
 }
 
 // buildPostgresDSN returns a libpq-style DSN.
@@ -94,6 +94,35 @@ func buildPostgresDSN() string {
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		host, port, user, password, dbname, sslmode,
 	)
+}
+
+// buildTypesenseConfig returns the server URL and API key for Typesense.
+//
+// Priority (highest → lowest):
+//  1. TYPESENSE_URL  – full URL e.g. "http://geo-search:8108" (Render internal / self-hosted)
+//  2. Individual     – TYPESENSE_HOST / TYPESENSE_PORT (with TYPESENSE_API_KEY)
+func buildTypesenseConfig() (serverURL string, apiKey string) {
+	apiKey = os.Getenv("TYPESENSE_API_KEY") // explicit — never silently empty
+
+	// 1. Full URL var — preferred in all cloud environments
+	if v := os.Getenv("TYPESENSE_URL"); v != "" {
+		log.Printf("[config] Typesense: using TYPESENSE_URL → %s", v)
+		return v, apiKey
+	}
+
+	// 2. Individual vars — used in local dev / docker-compose
+	host := os.Getenv("TYPESENSE_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("TYPESENSE_PORT")
+	if port == "" {
+		port = "8108"
+	}
+
+	built := fmt.Sprintf("http://%s:%s", host, port)
+	log.Printf("[config] Typesense: TYPESENSE_HOST=%q TYPESENSE_PORT=%q → %s", host, port, built)
+	return built, apiKey
 }
 
 // buildRedisConfig returns (addr, password) for go-redis.
