@@ -27,7 +27,7 @@ export async function searchGeoData(
   }
 
   try {
-    const url = `http://localhost:8080/api/v1/search?q=${encodeURIComponent(searchQuery.trim())}`;
+    const url = `https://geo-api-7ngv.onrender.com/api/v1/search?q=${encodeURIComponent(searchQuery.trim())}`;
     const res = await fetch(url, {
       method: 'GET',
       headers: {

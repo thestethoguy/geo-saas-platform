@@ -225,7 +225,7 @@ export default function DashboardPage() {
           <div className="flex items-center gap-3">
             <span className="hidden md:flex items-center gap-1.5 text-xs" style={{ color: 'var(--text-muted)' }}>
               <span className="w-1.5 h-1.5 rounded-full bg-green-400 pulse-dot" />
-              Go backend · localhost:8080
+              Go backend · geo-api-7ngv.onrender.com
             </span>
             <button
               id="upgrade-plan-btn"
@@ -268,7 +268,7 @@ export default function DashboardPage() {
                   <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                     Live connection →{' '}
                     <code className="px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-elevated)', color: 'var(--accent-light)' }}>
-                      localhost:8080/api/v1/search
+                      geo-api-7ngv.onrender.com/api/v1/search
                     </code>
                   </p>
                 </div>
