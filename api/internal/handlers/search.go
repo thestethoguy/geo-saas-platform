@@ -100,7 +100,7 @@ func (h *SearchHandler) Search(w http.ResponseWriter, r *http.Request) {
 	//               is 2 but we make it explicit for documentation clarity).
 	// prefix=true — enables prefix matching so "Koram" matches "Koramangala".
 	// prioritize_exact_match=true — bubbles exact-match results to the top.
-	queryBy    := "village_name,full_address,district_name,state_name"
+	queryBy    := "village_name,sub_district_name,district_name,state_name"
 	numTypos   := "2"
 	prefix     := "true"
 	exactMatch := true

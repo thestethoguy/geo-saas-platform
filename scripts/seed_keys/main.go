@@ -49,14 +49,22 @@ func main() {
 	}
 
 	// ── 2. Connect to Postgres ────────────────────────────────────────────
-	dsn := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		getEnv("POSTGRES_HOST", "localhost"),
-		getEnv("POSTGRES_PORT", "5432"),
-		getEnv("POSTGRES_USER", "geouser"),
-		getEnv("POSTGRES_PASSWORD", "geopassword"),
-		getEnv("POSTGRES_DB", "geosaas"),
-	)
+	// Priority: DATABASE_URL (Neon / Render / Railway set this with sslmode already embedded)
+	//           → individual POSTGRES_* vars as fallback (local/docker).
+	var dsn string
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		log.Println("PostgreSQL: using DATABASE_URL")
+		dsn = dbURL
+	} else {
+		dsn = fmt.Sprintf(
+			"host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
+			getEnv("POSTGRES_HOST", "localhost"),
+			getEnv("POSTGRES_PORT", "5432"),
+			getEnv("POSTGRES_USER", "geouser"),
+			getEnv("POSTGRES_PASSWORD", "geopassword"),
+			getEnv("POSTGRES_DB", "geosaas"),
+		)
+	}
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {

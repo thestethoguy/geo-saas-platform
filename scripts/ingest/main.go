@@ -1,15 +1,22 @@
-// Package main is a standalone ETL script that:
-//  1. Reads LGD geographical data from a CSV file
-//  2. Inserts it hierarchically into PostgreSQL (states → districts → sub_districts → villages)
-//  3. Indexes every village as a full-address search document in Typesense
+// Geo SaaS — Bulk Ingestion Engine (V1 Production)
+//
+// Full-reload ETL for ~650k villages from master_india_villages.csv.
+// Performance strategy:
+//   - Hierarchy tables (states/districts/sub_districts): batch INSERT ON CONFLICT DO NOTHING
+//   - Villages: PostgreSQL COPY protocol via pq.CopyIn in chunks of 2,000 (fastest bulk loader)
+//   - Typesense:  JSONL import in batches of 1,000
+//
+// ⚠ This script TRUNCATES the villages table and drops+recreates the Typesense
+//   collection before loading. It is a clean-slate production loader.
 //
 // Usage:
 //
-//	go run main.go                          # uses default paths
-//	CSV_PATH=../../data/custom.csv go run main.go
+//	go run main.go
+//	CSV_PATH=/path/to/custom.csv go run main.go
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -19,50 +26,56 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const (
+	villageCopyChunk = 2_000 // villages per COPY transaction
+	tsBatchSize      = 1_000 // Typesense JSONL batch size
+	logEvery         = 1_000 // progress log interval (villages)
+	tsCollection     = "villages"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data structures
 // ─────────────────────────────────────────────────────────────────────────────
 
-// CSVRow mirrors one line in sample_lgd_data.csv
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal hierarchy row types (used only inside ingestHierarchy helpers)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type stateRow    struct{ lgd, name string }
+type distRow     struct{ lgd, name, stateLGD string }
+type subDistRow  struct{ lgd, name, districtLGD string }
+
+// CSVRow is one row from master_india_villages.csv.
 type CSVRow struct {
-	StateLGD       string
-	StateName      string
-	DistrictLGD    string
-	DistrictName   string
-	SubDistrictLGD string
+	StateLGD        string
+	StateName       string
+	DistrictLGD     string
+	DistrictName    string
+	SubDistrictLGD  string
 	SubDistrictName string
-	VillageLGD     string
-	VillageName    string
-	CensusCode     string
-	Pincode        string
-	Latitude       string
-	Longitude      string
-	Population     string
+	VillageLGD      string
+	VillageName     string
 }
 
-// VillageDoc is the flattened document we index in Typesense
+// VillageDoc is the flattened Typesense document (V1 schema, 6 fields).
 type VillageDoc struct {
-	ID              string  `json:"id"`              // village lgd_code (must be string in TS)
-	VillageName     string  `json:"village_name"`
-	SubDistrictName string  `json:"sub_district_name"`
-	DistrictName    string  `json:"district_name"`
-	StateName       string  `json:"state_name"`
-	FullAddress     string  `json:"full_address"`    // "Village, Sub-District, District, State, India"
-	VillageLGD      string  `json:"village_lgd"`
-	Pincode         string  `json:"pincode"`
-	Latitude        float64 `json:"latitude"`
-	Longitude       float64 `json:"longitude"`
-	Population      int64   `json:"population"`
+	ID              string `json:"id"`
+	VillageName     string `json:"village_name"`
+	SubDistrictName string `json:"sub_district_name"`
+	DistrictName    string `json:"district_name"`
+	StateName       string `json:"state_name"`
+	LGDCode         string `json:"lgd_code"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,36 +83,62 @@ type VillageDoc struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type config struct {
-	postgresDSN     string
-	typesenseHost   string
-	typesensePort   string
-	typesenseAPIKey string
-	csvPath         string
+	postgresDSN       string
+	typesenseBase     string // full URL e.g. "http://localhost:8108"
+	typesenseAPIKey   string
+	csvPath           string
 }
 
 func loadConfig() config {
-	// Walk up until we find the .env file (project root)
-	_, filename, _, _ := runtime.Caller(0)
-	projectRoot := filepath.Join(filepath.Dir(filename), "..", "..")
-	_ = godotenv.Load(filepath.Join(projectRoot, ".env"))
+	// Try cwd/.env first  → works when run from project root: go run scripts/ingest/main.go
+	// Fall back to ../../.env → works when run from scripts/ingest/: go run main.go
+	if err := godotenv.Load(); err != nil {
+		if fbErr := godotenv.Load("../../.env"); fbErr != nil {
+			log.Printf("WARN: .env not found in cwd or ../../.env — relying on shell environment")
+		} else {
+			log.Println(".env loaded from ../../.env")
+		}
+	} else {
+		log.Println(".env loaded from cwd/.env")
+	}
 
-	host     := getEnv("POSTGRES_HOST", "localhost")
-	port     := getEnv("POSTGRES_PORT", "5432")
-	user     := getEnv("POSTGRES_USER", "geouser")
-	password := getEnv("POSTGRES_PASSWORD", "geopassword")
-	dbname   := getEnv("POSTGRES_DB", "geosaas")
+	// ── PostgreSQL DSN ─────────────────────────────────────────────────────
+	// Priority: DATABASE_URL (single connection string) → individual vars.
+	// DATABASE_URL is the standard set by Render, Railway, Heroku, etc.
+	var dsn string
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		log.Println("[config] PostgreSQL: using DATABASE_URL")
+		dsn = dbURL
+	} else {
+		host     := getEnv("POSTGRES_HOST",     "")
+		port     := getEnv("POSTGRES_PORT",     "5432")
+		user     := getEnv("POSTGRES_USER",     "")
+		password := getEnv("POSTGRES_PASSWORD", "")
+		dbname   := getEnv("POSTGRES_DB",       "")
 
-	csvDefault := filepath.Join(projectRoot, "data", "sample_lgd_data.csv")
-
-	return config{
-		postgresDSN: fmt.Sprintf(
+		if host == "" || user == "" || dbname == "" {
+			log.Fatalf("FATAL: DATABASE_URL is missing. Check your .env file path.\n" +
+				"  Tried: .env (cwd) and ../../.env (project root fallback)\n" +
+				"  Set DATABASE_URL or POSTGRES_HOST/USER/PASSWORD/DB in your environment.")
+		}
+		dsn = fmt.Sprintf(
 			"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 			host, port, user, password, dbname,
-		),
-		typesenseHost:   getEnv("TYPESENSE_HOST", "localhost"),
-		typesensePort:   getEnv("TYPESENSE_PORT", "8108"),
+		)
+	}
+
+	protocol := getEnv("TYPESENSE_PROTOCOL", "http")
+	tsHost   := getEnv("TYPESENSE_HOST", "localhost")
+	tsPort   := getEnv("TYPESENSE_PORT", "8108")
+
+
+	return config{
+		postgresDSN:     dsn,
+		typesenseBase:   fmt.Sprintf("%s://%s:%s", protocol, tsHost, tsPort),
 		typesenseAPIKey: getEnv("TYPESENSE_API_KEY", "typesense-dev-key"),
-		csvPath:         getEnv("CSV_PATH", csvDefault),
+		// Plain relative path — resolves from wherever the script is invoked.
+		// Override with: CSV_PATH=/absolute/path/to/file.csv go run scripts/ingest/main.go
+		csvPath: getEnv("CSV_PATH", "data/processed/master_india_villages.csv"),
 	}
 }
 
@@ -117,50 +156,52 @@ func getEnv(key, fallback string) string {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[ingest] ")
+	start := time.Now()
 
 	cfg := loadConfig()
 
-	// ── 1. Connect to Postgres ────────────────────────────────────────────
+	// 1. Connect Postgres
 	db, err := connectPostgres(cfg.postgresDSN)
 	if err != nil {
-		log.Fatalf("FATAL: Postgres connection failed: %v", err)
+		log.Fatalf("FATAL: %v", err)
 	}
 	defer db.Close()
 
-	// ── 2. Read CSV ───────────────────────────────────────────────────────
+	// 2. Read CSV
 	rows, err := readCSV(cfg.csvPath)
 	if err != nil {
-		log.Fatalf("FATAL: Could not read CSV at %s: %v", cfg.csvPath, err)
+		log.Fatalf("FATAL: CSV read failed (%s): %v", cfg.csvPath, err)
 	}
-	log.Printf("CSV loaded — %d data rows found in %s", len(rows), cfg.csvPath)
+	log.Printf("CSV loaded — %d rows from %s", len(rows), cfg.csvPath)
 
-	// ── 3. Ingest into Postgres ───────────────────────────────────────────
-	docs, err := ingestPostgres(db, rows)
+	// 3. Ingest hierarchy (states → districts → sub_districts)
+	subDistMap, err := ingestHierarchy(db, rows)
 	if err != nil {
-		log.Fatalf("FATAL: Postgres ingestion failed: %v", err)
+		log.Fatalf("FATAL: hierarchy ingest failed: %v", err)
 	}
 
-	// ── 4. Ping Typesense (fail fast if unreachable) ─────────────────────
-	tsBase := fmt.Sprintf("http://%s:%s", cfg.typesenseHost, cfg.typesensePort)
-	if err := pingTypesense(tsBase, cfg.typesenseAPIKey); err != nil {
-		log.Fatalf("FATAL: Typesense unreachable at %s: %v", tsBase, err)
+	// 4. Bulk-load villages (TRUNCATE + COPY)
+	docs, err := ingestVillages(db, rows, subDistMap)
+	if err != nil {
+		log.Fatalf("FATAL: village ingest failed: %v", err)
 	}
 
-	// ── 5. Ensure Typesense collection exists ─────────────────────────────
-	if err := ensureTypesenseCollection(tsBase, cfg.typesenseAPIKey); err != nil {
+	// 5. Typesense — ping, recreate collection, bulk index
+	if err := pingTypesense(cfg.typesenseBase, cfg.typesenseAPIKey); err != nil {
+		log.Fatalf("FATAL: Typesense unreachable at %s: %v", cfg.typesenseBase, err)
+	}
+	if err := recreateTypesenseCollection(cfg.typesenseBase, cfg.typesenseAPIKey); err != nil {
 		log.Fatalf("FATAL: Typesense collection setup failed: %v", err)
 	}
-
-	// ── 6. Index villages in Typesense ────────────────────────────────────
-	if err := indexTypesense(tsBase, cfg.typesenseAPIKey, docs); err != nil {
+	if err := indexTypesense(cfg.typesenseBase, cfg.typesenseAPIKey, docs); err != nil {
 		log.Fatalf("FATAL: Typesense indexing failed: %v", err)
 	}
 
-	log.Println("✅ Ingestion complete!")
+	log.Printf("✅ Ingestion complete in %s", time.Since(start).Round(time.Second))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PostgreSQL helpers
+// Postgres: connect
 // ─────────────────────────────────────────────────────────────────────────────
 
 func connectPostgres(dsn string) (*sql.DB, error) {
@@ -168,362 +209,438 @@ func connectPostgres(dsn string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Retry ping — Postgres may still be starting when this script runs
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	for i := 1; i <= 5; i++ {
 		if err = db.Ping(); err == nil {
 			log.Println("PostgreSQL connected ✓")
 			return db, nil
 		}
-		log.Printf("Postgres not ready (attempt %d/5): %v — retrying in 3s", i, err)
+		log.Printf("Postgres not ready (%d/5): %v — retrying in 3s", i, err)
 		time.Sleep(3 * time.Second)
 	}
 	return nil, fmt.Errorf("postgres unreachable after 5 attempts: %w", err)
 }
 
-// ingestPostgres walks the deduplicated hierarchy and upserts rows level by level.
-// It returns a slice of VillageDoc ready for Typesense indexing.
-func ingestPostgres(db *sql.DB, rows []CSVRow) ([]VillageDoc, error) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Postgres: hierarchy ingest
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ingestHierarchy inserts all unique states, districts and sub_districts in
+// three small batch INSERTs, then returns an in-memory map of
+// sub_district lgd_code → UUID string for use during village loading.
+func ingestHierarchy(db *sql.DB, rows []CSVRow) (map[string]string, error) {
 	ctx := context.Background()
 
-	// Deduplication maps: lgd_code → internal DB id
-	stateIDs       := make(map[string]int)
-	districtIDs    := make(map[string]int)
-	subDistrictIDs := make(map[string]int)
-
-	// Counters
+	// ── Collect unique entries (preserve first-seen order) ────────────────
 	var (
-		statesInserted, statesSkipped           int
-		districtsInserted, districtsSkipped     int
-		subDistInserted, subDistSkipped         int
-		villagesInserted, villagesSkipped       int
+		stateSeen   = map[string]bool{}
+		distSeen    = map[string]bool{}
+		subDistSeen = map[string]bool{}
+
+		states       []stateRow
+		districts    []distRow
+		subDistricts []subDistRow
 	)
 
-	var docs []VillageDoc
-
-	// ── BEGIN transaction ──────────────────────────────────────────────────
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
+	for _, r := range rows {
+		if !stateSeen[r.StateLGD] {
+			stateSeen[r.StateLGD] = true
+			states = append(states, stateRow{r.StateLGD, r.StateName})
+		}
+		if !distSeen[r.DistrictLGD] {
+			distSeen[r.DistrictLGD] = true
+			districts = append(districts, distRow{r.DistrictLGD, r.DistrictName, r.StateLGD})
+		}
+		if !subDistSeen[r.SubDistrictLGD] {
+			subDistSeen[r.SubDistrictLGD] = true
+			subDistricts = append(subDistricts, subDistRow{r.SubDistrictLGD, r.SubDistrictName, r.DistrictLGD})
+		}
 	}
-	defer func() {
+
+	log.Printf("Hierarchy: %d states, %d districts, %d sub-districts to insert",
+		len(states), len(districts), len(subDistricts))
+
+	// ── 1. Insert states ──────────────────────────────────────────────────
+	if err := batchInsertStates(ctx, db, states); err != nil {
+		return nil, fmt.Errorf("insert states: %w", err)
+	}
+	stateUUIDs, err := loadUUIDs(ctx, db, "states")
+	if err != nil {
+		return nil, fmt.Errorf("load state UUIDs: %w", err)
+	}
+	log.Printf("States done ✓  (%d UUIDs loaded)", len(stateUUIDs))
+
+	// ── 2. Insert districts ───────────────────────────────────────────────
+	if err := batchInsertDistricts(ctx, db, districts, stateUUIDs); err != nil {
+		return nil, fmt.Errorf("insert districts: %w", err)
+	}
+	districtUUIDs, err := loadUUIDs(ctx, db, "districts")
+	if err != nil {
+		return nil, fmt.Errorf("load district UUIDs: %w", err)
+	}
+	log.Printf("Districts done ✓  (%d UUIDs loaded)", len(districtUUIDs))
+
+	// ── 3. Insert sub_districts ───────────────────────────────────────────
+	if err := batchInsertSubDistricts(ctx, db, subDistricts, districtUUIDs); err != nil {
+		return nil, fmt.Errorf("insert sub_districts: %w", err)
+	}
+	subDistUUIDs, err := loadUUIDs(ctx, db, "sub_districts")
+	if err != nil {
+		return nil, fmt.Errorf("load sub_district UUIDs: %w", err)
+	}
+	log.Printf("Sub-districts done ✓  (%d UUIDs loaded)", len(subDistUUIDs))
+
+	return subDistUUIDs, nil
+}
+
+// batchInsertStates inserts all states in a single multi-row INSERT.
+func batchInsertStates(ctx context.Context, db *sql.DB, states []stateRow) error {
+	if len(states) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO states (lgd_code, name) VALUES ")
+	args := make([]interface{}, 0, len(states)*2)
+	for i, s := range states {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "($%d,$%d)", i*2+1, i*2+2)
+		args = append(args, s.lgd, s.name)
+	}
+	sb.WriteString(" ON CONFLICT (lgd_code) DO NOTHING")
+	_, err := db.ExecContext(ctx, sb.String(), args...)
+	return err
+}
+
+// batchInsertDistricts inserts all districts resolving state UUIDs from the map.
+func batchInsertDistricts(ctx context.Context, db *sql.DB, districts []distRow, stateUUIDs map[string]string) error {
+	if len(districts) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO districts (lgd_code, name, state_id) VALUES ")
+	args := make([]interface{}, 0, len(districts)*3)
+	for i, d := range districts {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "($%d,$%d,$%d::uuid)", i*3+1, i*3+2, i*3+3)
+		args = append(args, d.lgd, d.name, stateUUIDs[d.stateLGD])
+	}
+	sb.WriteString(" ON CONFLICT (lgd_code) DO NOTHING")
+	_, err := db.ExecContext(ctx, sb.String(), args...)
+	return err
+}
+
+// batchInsertSubDistricts inserts all sub_districts resolving district UUIDs.
+func batchInsertSubDistricts(ctx context.Context, db *sql.DB, subs []subDistRow, districtUUIDs map[string]string) error {
+	if len(subs) == 0 {
+		return nil
+	}
+	// Sub-districts can exceed 6000 rows × 3 params = 18k params — well within the 65535 limit.
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO sub_districts (lgd_code, name, district_id) VALUES ")
+	args := make([]interface{}, 0, len(subs)*3)
+	for i, s := range subs {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "($%d,$%d,$%d::uuid)", i*3+1, i*3+2, i*3+3)
+		args = append(args, s.lgd, s.name, districtUUIDs[s.districtLGD])
+	}
+	sb.WriteString(" ON CONFLICT (lgd_code) DO NOTHING")
+	_, err := db.ExecContext(ctx, sb.String(), args...)
+	return err
+}
+
+// loadUUIDs returns lgd_code → id::text for any geo table.
+func loadUUIDs(ctx context.Context, db *sql.DB, table string) (map[string]string, error) {
+	//nolint:gosec — table name is an internal constant, not user input
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT lgd_code, id::text FROM %s", table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	m := make(map[string]string)
+	for rows.Next() {
+		var lgd, id string
+		if err := rows.Scan(&lgd, &id); err != nil {
+			return nil, err
+		}
+		m[lgd] = id
+	}
+	return m, rows.Err()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Postgres: village bulk load via COPY
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ingestVillages truncates the villages table, then loads all rows using
+// PostgreSQL's COPY protocol in chunks of villageCopyChunk for progress logging.
+// It simultaneously builds the []VillageDoc slice for Typesense indexing.
+func ingestVillages(db *sql.DB, rows []CSVRow, subDistMap map[string]string) ([]VillageDoc, error) {
+	ctx := context.Background()
+
+	// De-duplicate villages by lgd_code (CSV may have duplicates)
+	seen := make(map[string]bool, len(rows))
+	unique := rows[:0]
+	for _, r := range rows {
+		if r.VillageLGD == "" || seen[r.VillageLGD] {
+			continue
+		}
+		seen[r.VillageLGD] = true
+		unique = append(unique, r)
+	}
+	total := len(unique)
+	log.Printf("Villages to load: %d unique (of %d CSV rows)", total, len(rows))
+
+	// TRUNCATE to ensure a clean slate before COPY
+	if _, err := db.ExecContext(ctx, "TRUNCATE villages"); err != nil {
+		return nil, fmt.Errorf("TRUNCATE villages: %w", err)
+	}
+	log.Println("Villages table truncated ✓")
+
+	docs := make([]VillageDoc, 0, total)
+	loaded := 0
+	skipped := 0
+
+	for chunkStart := 0; chunkStart < total; chunkStart += villageCopyChunk {
+		end := chunkStart + villageCopyChunk
+		if end > total {
+			end = total
+		}
+		chunk := unique[chunkStart:end]
+
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, fmt.Errorf("begin tx: %w", err)
+		}
+
+		stmt, err := tx.Prepare(pq.CopyIn("villages", "lgd_code", "name", "sub_district_id"))
 		if err != nil {
 			_ = tx.Rollback()
-		}
-	}()
-
-	for _, row := range rows {
-
-		// ── State ──────────────────────────────────────────────────────────
-		if _, seen := stateIDs[row.StateLGD]; !seen {
-			id, inserted, e := upsertState(ctx, tx, row.StateLGD, row.StateName)
-			if e != nil {
-				return nil, fmt.Errorf("upsert state %s: %w", row.StateName, e)
-			}
-			stateIDs[row.StateLGD] = id
-			if inserted {
-				log.Printf("  ✚ Inserted State    : %s (lgd=%s)", row.StateName, row.StateLGD)
-				statesInserted++
-			} else {
-				statesSkipped++
-			}
+			return nil, fmt.Errorf("prepare COPY: %w", err)
 		}
 
-		// ── District ───────────────────────────────────────────────────────
-		if _, seen := districtIDs[row.DistrictLGD]; !seen {
-			stateID := stateIDs[row.StateLGD]
-			id, inserted, e := upsertDistrict(ctx, tx, row.DistrictLGD, row.DistrictName, stateID)
-			if e != nil {
-				return nil, fmt.Errorf("upsert district %s: %w", row.DistrictName, e)
+		for _, r := range chunk {
+			subDistID, ok := subDistMap[r.SubDistrictLGD]
+			if !ok {
+				log.Printf("WARN: sub_district lgd_code %q not found — skipping village %q",
+					r.SubDistrictLGD, r.VillageName)
+				skipped++
+				continue
 			}
-			districtIDs[row.DistrictLGD] = id
-			if inserted {
-				log.Printf("  ✚ Inserted District : %s (lgd=%s)", row.DistrictName, row.DistrictLGD)
-				districtsInserted++
-			} else {
-				districtsSkipped++
+			if _, err := stmt.Exec(r.VillageLGD, r.VillageName, subDistID); err != nil {
+				_ = tx.Rollback()
+				return nil, fmt.Errorf("COPY row (lgd=%s): %w", r.VillageLGD, err)
 			}
+			docs = append(docs, VillageDoc{
+				ID:              r.VillageLGD,
+				VillageName:     r.VillageName,
+				SubDistrictName: r.SubDistrictName,
+				DistrictName:    r.DistrictName,
+				StateName:       r.StateName,
+				LGDCode:         r.VillageLGD,
+			})
 		}
 
-		// ── Sub-District ───────────────────────────────────────────────────
-		if _, seen := subDistrictIDs[row.SubDistrictLGD]; !seen {
-			districtID := districtIDs[row.DistrictLGD]
-			id, inserted, e := upsertSubDistrict(ctx, tx, row.SubDistrictLGD, row.SubDistrictName, districtID)
-			if e != nil {
-				return nil, fmt.Errorf("upsert sub_district %s: %w", row.SubDistrictName, e)
-			}
-			subDistrictIDs[row.SubDistrictLGD] = id
-			if inserted {
-				log.Printf("  ✚ Inserted Sub-Dist : %s (lgd=%s)", row.SubDistrictName, row.SubDistrictLGD)
-				subDistInserted++
-			} else {
-				subDistSkipped++
-			}
+		// Flush buffer to Postgres
+		if _, err := stmt.Exec(); err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("COPY flush: %w", err)
+		}
+		if err := stmt.Close(); err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("COPY close: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit: %w", err)
 		}
 
-		// ── Village ────────────────────────────────────────────────────────
-		subDistID := subDistrictIDs[row.SubDistrictLGD]
-		inserted, e := upsertVillage(ctx, tx, row, subDistID)
-		if e != nil {
-			return nil, fmt.Errorf("upsert village %s: %w", row.VillageName, e)
-		}
-		if inserted {
-			log.Printf("  ✚ Inserted Village  : %s (lgd=%s)", row.VillageName, row.VillageLGD)
-			villagesInserted++
-		} else {
-			villagesSkipped++
-		}
-
-		// Build Typesense document (regardless of insert/skip so we always index)
-		docs = append(docs, buildDoc(row))
+		loaded += len(chunk)
+		log.Printf("[Ingest] Successfully processed %d / %d villages...", loaded, total)
 	}
 
-	if err = tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
-	}
-
-	log.Printf("\n── Postgres Summary ─────────────────────────────────")
-	log.Printf("   States       : %d inserted, %d skipped (already existed)", statesInserted, statesSkipped)
-	log.Printf("   Districts    : %d inserted, %d skipped", districtsInserted, districtsSkipped)
-	log.Printf("   Sub-Districts: %d inserted, %d skipped", subDistInserted, subDistSkipped)
-	log.Printf("   Villages     : %d inserted, %d skipped", villagesInserted, villagesSkipped)
-	log.Println("─────────────────────────────────────────────────────")
-
+	log.Printf("Villages loaded ✓  (%d inserted, %d skipped)", loaded-skipped, skipped)
 	return docs, nil
 }
 
-// upsertState inserts a state if the lgd_code doesn't exist.
-// Returns the internal id and whether a new row was created.
-func upsertState(ctx context.Context, tx *sql.Tx, lgd, name string) (int, bool, error) {
-	var id int
-	var isNew bool
-	err := tx.QueryRowContext(ctx, `
-		INSERT INTO states (lgd_code, name)
-		VALUES ($1, $2)
-		ON CONFLICT (lgd_code) DO NOTHING
-		RETURNING id, true
-	`, lgd, name).Scan(&id, &isNew)
-
-	if err == sql.ErrNoRows {
-		// Row already existed — fetch its id
-		err = tx.QueryRowContext(ctx, `SELECT id FROM states WHERE lgd_code = $1`, lgd).Scan(&id)
-		return id, false, err
-	}
-	return id, isNew, err
-}
-
-func upsertDistrict(ctx context.Context, tx *sql.Tx, lgd, name string, stateID int) (int, bool, error) {
-	var id int
-	var isNew bool
-	err := tx.QueryRowContext(ctx, `
-		INSERT INTO districts (lgd_code, name, state_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (lgd_code) DO NOTHING
-		RETURNING id, true
-	`, lgd, name, stateID).Scan(&id, &isNew)
-
-	if err == sql.ErrNoRows {
-		err = tx.QueryRowContext(ctx, `SELECT id FROM districts WHERE lgd_code = $1`, lgd).Scan(&id)
-		return id, false, err
-	}
-	return id, isNew, err
-}
-
-func upsertSubDistrict(ctx context.Context, tx *sql.Tx, lgd, name string, districtID int) (int, bool, error) {
-	var id int
-	var isNew bool
-	err := tx.QueryRowContext(ctx, `
-		INSERT INTO sub_districts (lgd_code, name, district_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (lgd_code) DO NOTHING
-		RETURNING id, true
-	`, lgd, name, districtID).Scan(&id, &isNew)
-
-	if err == sql.ErrNoRows {
-		err = tx.QueryRowContext(ctx, `SELECT id FROM sub_districts WHERE lgd_code = $1`, lgd).Scan(&id)
-		return id, false, err
-	}
-	return id, isNew, err
-}
-
-func upsertVillage(ctx context.Context, tx *sql.Tx, row CSVRow, subDistID int) (bool, error) {
-	var isNew bool
-	var id int
-
-	lat, _ := strconv.ParseFloat(strings.TrimSpace(row.Latitude), 64)
-	lon, _ := strconv.ParseFloat(strings.TrimSpace(row.Longitude), 64)
-	pop, _ := strconv.ParseInt(strings.TrimSpace(row.Population), 10, 64)
-
-	err := tx.QueryRowContext(ctx, `
-		INSERT INTO villages (lgd_code, name, sub_district_id, census_code, pincode, latitude, longitude, population)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (lgd_code) DO NOTHING
-		RETURNING id, true
-	`, row.VillageLGD, row.VillageName, subDistID,
-		nullStr(row.CensusCode), nullStr(row.Pincode),
-		lat, lon, pop,
-	).Scan(&id, &isNew)
-
-	if err == sql.ErrNoRows {
-		return false, nil // already existed
-	}
-	return isNew, err
-}
-
-// nullStr returns nil if s is empty so Postgres stores NULL instead of ""
-func nullStr(s string) interface{} {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	return s
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Typesense helpers  (using raw HTTP — avoids SDK version coupling)
+// Typesense helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const tsCollection = "villages"
-
-// typesenseCollectionSchema matches the Typesense REST API schema definition
 var typesenseCollectionSchema = map[string]interface{}{
 	"name": tsCollection,
 	"fields": []map[string]interface{}{
-		{"name": "id",               "type": "string"},
-		{"name": "village_name",     "type": "string"},
-		{"name": "sub_district_name","type": "string"},
-		{"name": "district_name",    "type": "string"},
-		{"name": "state_name",       "type": "string"},
-		{"name": "full_address",     "type": "string"},
-		{"name": "village_lgd",      "type": "string", "facet": false},
-		{"name": "pincode",          "type": "string", "optional": true},
-		{"name": "latitude",         "type": "float",  "optional": true},
-		{"name": "longitude",        "type": "float",  "optional": true},
-		{"name": "population",       "type": "int64"},  // NOT optional — required by default_sorting_field
+		{"name": "id",                "type": "string"},
+		{"name": "village_name",      "type": "string"},
+		{"name": "sub_district_name", "type": "string", "facet": true},
+		{"name": "district_name",     "type": "string", "facet": true},
+		{"name": "state_name",        "type": "string", "facet": true},
+		{"name": "lgd_code",          "type": "string"},
 	},
-	"default_sorting_field": "population",
 }
 
-// pingTypesense performs a GET /health and returns an error if Typesense is
-// unreachable or reports an unhealthy status.
-func pingTypesense(baseURL, apiKey string) error {
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequest("GET", baseURL+"/health", nil)
+// pingTypesense confirms Typesense is reachable and the API key is valid.
+// Uses GET /collections (works on both self-hosted and managed instances).
+func pingTypesense(base, apiKey string) error {
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, base+"/collections", nil)
+	if err != nil {
+		return err
+	}
 	req.Header.Set("X-TYPESENSE-API-KEY", apiKey)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("health GET: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("health check returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("invalid API key (401)")
 	}
-	log.Println("Typesense connected ✓")
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("server error: HTTP %d", resp.StatusCode)
+	}
+	log.Printf("Typesense connected ✓  (%s)", base)
 	return nil
 }
 
-// ensureTypesenseCollection creates the villages collection if it doesn't exist.
-func ensureTypesenseCollection(baseURL, apiKey string) error {
-	client := &http.Client{Timeout: 10 * time.Second}
+// recreateTypesenseCollection drops the collection if it exists, then creates
+// it fresh with the V1 schema. Ensures the schema is always in sync.
+func recreateTypesenseCollection(base, apiKey string) error {
+	client := &http.Client{Timeout: 15 * time.Second}
 
-	// Check if already exists
-	req, _ := http.NewRequest("GET", baseURL+"/collections/"+tsCollection, nil)
+	// Drop if exists
+	req, _ := http.NewRequest(http.MethodDelete, base+"/collections/"+tsCollection, nil)
 	req.Header.Set("X-TYPESENSE-API-KEY", apiKey)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("typesense health check: %w", err)
+		return fmt.Errorf("delete collection: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK {
-		log.Printf("Typesense collection '%s' already exists — skipping creation", tsCollection)
-		return nil
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+		log.Printf("Typesense collection %q dropped (or did not exist) ✓", tsCollection)
+	} else {
+		return fmt.Errorf("delete collection returned HTTP %d", resp.StatusCode)
 	}
 
-	// Create the collection
+	// Create
 	body, _ := json.Marshal(typesenseCollectionSchema)
-	req, _ = http.NewRequest("POST", baseURL+"/collections", strings.NewReader(string(body)))
-	req.Header.Set("X-TYPESENSE-API-KEY", apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err = client.Do(req)
+	req2, _ := http.NewRequest(http.MethodPost, base+"/collections", bytes.NewReader(body))
+	req2.Header.Set("X-TYPESENSE-API-KEY", apiKey)
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := client.Do(req2)
 	if err != nil {
 		return fmt.Errorf("create collection: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("create collection returned HTTP %d", resp.StatusCode)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		return fmt.Errorf("create collection returned HTTP %d", resp2.StatusCode)
 	}
-
-	log.Printf("Typesense collection '%s' created ✓", tsCollection)
+	log.Printf("Typesense collection %q created ✓", tsCollection)
 	return nil
 }
 
-// indexTypesense bulk-imports all village documents using Typesense's JSONL import API.
-func indexTypesense(baseURL, apiKey string, docs []VillageDoc) error {
+// indexTypesense sends all VillageDoc records to Typesense in JSONL batches.
+func indexTypesense(base, apiKey string, docs []VillageDoc) error {
 	if len(docs) == 0 {
+		log.Println("No Typesense documents to index.")
 		return nil
 	}
 
-	// Build JSONL payload (one JSON object per line)
-	var sb strings.Builder
-	for _, d := range docs {
-		line, err := json.Marshal(d)
+	client := &http.Client{Timeout: 60 * time.Second}
+	url := fmt.Sprintf("%s/collections/%s/documents/import?action=upsert", base, tsCollection)
+	total := len(docs)
+	indexed := 0
+
+	for batchStart := 0; batchStart < total; batchStart += tsBatchSize {
+		end := batchStart + tsBatchSize
+		if end > total {
+			end = total
+		}
+		batch := docs[batchStart:end]
+
+		// Encode as JSONL (newline-delimited JSON)
+		var buf bytes.Buffer
+		for _, d := range batch {
+			line, err := json.Marshal(d)
+			if err != nil {
+				return fmt.Errorf("marshal doc %s: %w", d.ID, err)
+			}
+			buf.Write(line)
+			buf.WriteByte('\n')
+		}
+
+		req, err := http.NewRequest(http.MethodPost, url, &buf)
 		if err != nil {
 			return err
 		}
-		sb.Write(line)
-		sb.WriteByte('\n')
-	}
+		req.Header.Set("X-TYPESENSE-API-KEY", apiKey)
+		req.Header.Set("Content-Type", "text/plain")
 
-	url := fmt.Sprintf("%s/collections/%s/documents/import?action=upsert", baseURL, tsCollection)
-	req, _ := http.NewRequest("POST", url, strings.NewReader(sb.String()))
-	req.Header.Set("X-TYPESENSE-API-KEY", apiKey)
-	req.Header.Set("Content-Type", "text/plain")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("typesense import request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Typesense returns one JSON result per line — check for errors
-	respBody, _ := io.ReadAll(resp.Body)
-	lines := strings.Split(strings.TrimSpace(string(respBody)), "\n")
-
-	successCount := 0
-	for i, line := range lines {
-		if line == "" {
-			continue
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("Typesense import batch starting at %d: %w", batchStart, err)
 		}
-		var result map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &result); err != nil {
-			log.Printf("  WARN: could not parse Typesense response line %d: %s", i+1, line)
-			continue
+
+		// Parse JSONL response — each line is {"success":true} or an error
+		batchErr := 0
+		scanner := newLineScanner(resp.Body)
+		for scanner.Scan() {
+			var result map[string]interface{}
+			if err := json.Unmarshal(scanner.Bytes(), &result); err != nil {
+				continue
+			}
+			if success, ok := result["success"].(bool); !ok || !success {
+				batchErr++
+			}
 		}
-		if success, ok := result["success"].(bool); ok && success {
-			successCount++
+		resp.Body.Close()
+
+		indexed += len(batch)
+		if batchErr > 0 {
+			log.Printf("[Ingest] Typesense batch %d–%d: %d errors", batchStart+1, end, batchErr)
 		} else {
-			log.Printf("  WARN: Typesense index failed for doc %d: %s", i+1, line)
+			log.Printf("[Ingest] Typesense: indexed %d / %d documents ✓", indexed, total)
 		}
 	}
 
-	log.Printf("\n── Typesense Summary ────────────────────────────────")
-	log.Printf("   Indexed Villages: %d / %d documents upserted ✓", successCount, len(docs))
-	for _, d := range docs {
-		log.Printf("  ★ Indexed Village  : %s", d.FullAddress)
-	}
-	log.Println("─────────────────────────────────────────────────────")
-
+	log.Printf("Typesense indexing complete ✓  (%d documents)", indexed)
 	return nil
 }
+
+// newLineScanner wraps an io.ReadCloser in a line-by-line bytes.Scanner.
+func newLineScanner(r io.ReadCloser) *lineScanner {
+	data, _ := io.ReadAll(r)
+	return &lineScanner{lines: bytes.Split(data, []byte("\n")), pos: 0}
+}
+
+type lineScanner struct {
+	lines [][]byte
+	pos   int
+	cur   []byte
+}
+
+func (s *lineScanner) Scan() bool {
+	for s.pos < len(s.lines) {
+		s.cur = bytes.TrimSpace(s.lines[s.pos])
+		s.pos++
+		if len(s.cur) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *lineScanner) Bytes() []byte { return s.cur }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CSV reader
 // ─────────────────────────────────────────────────────────────────────────────
 
-// readCSV opens the CSV, validates the header, and returns all data rows.
 func readCSV(path string) ([]CSVRow, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -533,17 +650,16 @@ func readCSV(path string) ([]CSVRow, error) {
 
 	reader := csv.NewReader(f)
 	reader.TrimLeadingSpace = true
+	reader.LazyQuotes = true // tolerate imperfect quoting in census files
 
-	// Read header
 	header, err := reader.Read()
 	if err != nil {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
 
-	// Build a column-index map so we're not brittle to column reordering
 	colIdx := make(map[string]int, len(header))
 	for i, h := range header {
-		colIdx[strings.TrimSpace(h)] = i
+		colIdx[strings.TrimSpace(strings.ToLower(h))] = i
 	}
 
 	required := []string{
@@ -554,11 +670,19 @@ func readCSV(path string) ([]CSVRow, error) {
 	}
 	for _, col := range required {
 		if _, ok := colIdx[col]; !ok {
-			return nil, fmt.Errorf("missing required column: %q", col)
+			return nil, fmt.Errorf("missing required column %q (found: %v)", col, header)
 		}
 	}
 
-	var rows []CSVRow
+	get := func(record []string, col string) string {
+		i, ok := colIdx[col]
+		if !ok || i >= len(record) {
+			return ""
+		}
+		return strings.TrimSpace(record[i])
+	}
+
+	rows := make([]CSVRow, 0, 700_000)
 	lineNum := 1
 	for {
 		record, err := reader.Read()
@@ -569,58 +693,16 @@ func readCSV(path string) ([]CSVRow, error) {
 			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
 		lineNum++
-
-		get := func(col string) string {
-			i, ok := colIdx[col]
-			if !ok || i >= len(record) {
-				return ""
-			}
-			return strings.TrimSpace(record[i])
-		}
-
 		rows = append(rows, CSVRow{
-			StateLGD:        get("state_lgd_code"),
-			StateName:       get("state_name"),
-			DistrictLGD:     get("district_lgd_code"),
-			DistrictName:    get("district_name"),
-			SubDistrictLGD:  get("sub_district_lgd_code"),
-			SubDistrictName: get("sub_district_name"),
-			VillageLGD:      get("village_lgd_code"),
-			VillageName:     get("village_name"),
-			CensusCode:      get("census_code"),
-			Pincode:         get("pincode"),
-			Latitude:        get("latitude"),
-			Longitude:       get("longitude"),
-			Population:      get("population"),
+			StateLGD:        get(record, "state_lgd_code"),
+			StateName:       get(record, "state_name"),
+			DistrictLGD:     get(record, "district_lgd_code"),
+			DistrictName:    get(record, "district_name"),
+			SubDistrictLGD:  get(record, "sub_district_lgd_code"),
+			SubDistrictName: get(record, "sub_district_name"),
+			VillageLGD:      get(record, "village_lgd_code"),
+			VillageName:     get(record, "village_name"),
 		})
 	}
-
 	return rows, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Document builder
-// ─────────────────────────────────────────────────────────────────────────────
-
-func buildDoc(row CSVRow) VillageDoc {
-	lat, _ := strconv.ParseFloat(strings.TrimSpace(row.Latitude), 64)
-	lon, _ := strconv.ParseFloat(strings.TrimSpace(row.Longitude), 64)
-	pop, _ := strconv.ParseInt(strings.TrimSpace(row.Population), 10, 64)
-
-	full := fmt.Sprintf("%s, %s, %s, %s, India",
-		row.VillageName, row.SubDistrictName, row.DistrictName, row.StateName)
-
-	return VillageDoc{
-		ID:              row.VillageLGD, // Typesense requires string id
-		VillageName:     row.VillageName,
-		SubDistrictName: row.SubDistrictName,
-		DistrictName:    row.DistrictName,
-		StateName:       row.StateName,
-		FullAddress:     full,
-		VillageLGD:      row.VillageLGD,
-		Pincode:         row.Pincode,
-		Latitude:        lat,
-		Longitude:       lon,
-		Population:      pop,
-	}
 }

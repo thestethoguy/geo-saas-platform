@@ -14,20 +14,29 @@ type Client struct {
 	rdb *redis.Client
 }
 
-// NewRedisClient creates and validates a Redis connection.
-// addr  – "host:port"
-// pass  – REDIS_PASSWORD (empty string = no auth)
-func NewRedisClient(addr, pass string) (*Client, error) {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         addr,
-		Password:     pass,
-		DB:           0, // default database
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		PoolSize:     10,
-		MinIdleConns: 2,
-	})
+// NewRedisClient creates and validates a Redis connection from a full URL.
+//
+//   redisURL – full connection URL, e.g.:
+//     "redis://:password@localhost:6379"          (plain-text, local/docker)
+//     "rediss://user:password@host:6380"          (TLS — Upstash / Render / Railway)
+//
+// redis.ParseURL() reads the scheme and enables TLS automatically for "rediss://",
+// which fixes the EOF error seen when connecting to Upstash with a plain Options struct.
+func NewRedisClient(redisURL string) (*Client, error) {
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, fmt.Errorf("redis: invalid URL: %w", err)
+	}
+
+	// Layer our connection-pool tuning on top of what ParseURL provides.
+	// ParseURL already sets Addr, Password, DB, and TLSConfig from the URL.
+	opts.DialTimeout  = 5 * time.Second
+	opts.ReadTimeout  = 3 * time.Second
+	opts.WriteTimeout = 3 * time.Second
+	opts.PoolSize     = 10
+	opts.MinIdleConns = 2
+
+	rdb := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

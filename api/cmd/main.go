@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 
 	"geo-saas-platform/internal/cache"
 	"geo-saas-platform/internal/config"
@@ -35,7 +36,7 @@ func main() {
 	defer db.Close()
 
 	// ── 3. Connect to Redis ───────────────────────────────────────────────
-	redisClient, err := cache.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
+	redisClient, err := cache.NewRedisClient(cfg.RedisURL)
 	if err != nil {
 		log.Fatalf("[main] FATAL: could not connect to Redis: %v", err)
 	}
@@ -60,6 +61,16 @@ func main() {
 	r := chi.NewRouter()
 
 	// ── Middleware stack ──────────────────────────────────────────────────
+	// CORS must come first so preflight OPTIONS requests are answered before
+	// any auth or rate-limit middleware runs.
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:3000", "http://127.0.0.1:3000", "https://*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Authorization", "Content-Type", "Accept", "X-Request-Id"},
+		ExposedHeaders:   []string{"X-Cache", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"},
+		AllowCredentials: false,
+		MaxAge:           300, // preflight cache: 5 minutes
+	}))
 	r.Use(middleware.RequestID)                // injects X-Request-Id header
 	r.Use(middleware.RealIP)                   // trusts X-Real-IP / X-Forwarded-For
 	r.Use(middleware.Logger)                   // structured access log to stdout

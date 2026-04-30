@@ -192,14 +192,14 @@ export default function Sidebar() {
             className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
             style={{ background: "var(--accent)", color: "#fff" }}
           >
-            AK
+            AA
           </div>
           <div className="overflow-hidden flex-1">
             <p className="text-xs font-semibold truncate" style={{ color: "var(--text-primary)" }}>
-              Arjun Kumar
+              Aman Aaryan
             </p>
             <p className="text-xs truncate" style={{ color: "var(--text-muted)" }}>
-              admin@geodata.io
+              amanaaryan672@gmail.com
             </p>
           </div>
           <button id="user-menu-btn" style={{ color: "var(--text-muted)" }}>

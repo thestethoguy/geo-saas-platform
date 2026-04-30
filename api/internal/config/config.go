@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"strconv"
 
@@ -20,9 +19,9 @@ type Config struct {
 	// PostgreSQL
 	PostgresDSN string
 
-	// Redis
-	RedisAddr     string
-	RedisPassword string
+	// Redis — full connection URL (redis:// or rediss:// for TLS).
+	// Passed verbatim to redis.ParseURL() so TLS is inherited from the scheme.
+	RedisURL string
 
 	// Typesense — use TypesenseURL field directly; Host/Port kept for reference
 	TypesenseServerURL string
@@ -38,7 +37,6 @@ func Load() *Config {
 		log.Println("[config] .env file not found, relying on environment variables")
 	}
 
-	redisAddr, redisPwd := buildRedisConfig()
 	tsURL, tsKey := buildTypesenseConfig()
 
 	cfg := &Config{
@@ -48,8 +46,7 @@ func Load() *Config {
 
 		PostgresDSN: buildPostgresDSN(),
 
-		RedisAddr:     redisAddr,
-		RedisPassword: redisPwd,
+		RedisURL: buildRedisURL(),
 
 		TypesenseServerURL: tsURL,
 		TypesenseAPIKey:    tsKey,
@@ -134,35 +131,30 @@ func buildTypesenseConfig() (serverURL string, apiKey string) {
 	return built, apiKey
 }
 
-// buildRedisConfig returns (addr, password) for go-redis.
+// buildRedisURL returns a full Redis connection URL for redis.ParseURL().
 //
 // Priority (highest → lowest):
-//  1. REDIS_URL  – redis://[:password@]host[:port][/db] (Render / Upstash / Railway)
-//  2. Individual – REDIS_HOST / REDIS_PORT / REDIS_PASSWORD
-func buildRedisConfig() (addr string, password string) {
+//  1. REDIS_URL  – passed verbatim; supports redis:// and rediss:// (TLS).
+//                  Upstash, Render, Railway and similar providers set this.
+//  2. Individual – REDIS_HOST / REDIS_PORT / REDIS_PASSWORD → redis://:pass@host:port
+//
+// The URL is handed directly to redis.ParseURL() in the cache package, which
+// automatically enables TLS when the scheme is "rediss".
+func buildRedisURL() string {
 	if raw := getEnv("REDIS_URL", ""); raw != "" {
-		u, err := url.Parse(raw)
-		if err != nil {
-			log.Printf("[config] Redis: failed to parse REDIS_URL (%v) — falling back to individual vars", err)
-		} else {
-			host := u.Hostname()
-			port := u.Port()
-			if port == "" {
-				port = "6379"
-			}
-			if u.User != nil {
-				password, _ = u.User.Password()
-			}
-			log.Printf("[config] Redis: using REDIS_URL → %s:%s", host, port)
-			return host + ":" + port, password
-		}
+		log.Printf("[config] Redis: using REDIS_URL (scheme preserved for TLS detection)")
+		return raw
 	}
 
 	// Fall back to individual variables (local / docker-compose)
-	host := getEnv("REDIS_HOST", "localhost")
-	port := getEnv("REDIS_PORT", "6379")
-	log.Printf("[config] Redis: connecting to %s:%s", host, port)
-	return host + ":" + port, getEnv("REDIS_PASSWORD", "")
+	host     := getEnv("REDIS_HOST",     "localhost")
+	port     := getEnv("REDIS_PORT",     "6379")
+	password := getEnv("REDIS_PASSWORD", "")
+	log.Printf("[config] Redis: building URL from individual vars → %s:%s", host, port)
+	if password != "" {
+		return fmt.Sprintf("redis://:%s@%s:%s", password, host, port)
+	}
+	return fmt.Sprintf("redis://%s:%s", host, port)
 }
 
 func getEnv(key, fallback string) string {
