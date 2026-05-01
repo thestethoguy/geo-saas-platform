@@ -131,10 +131,19 @@ func loadConfig() config {
 	tsHost   := getEnv("TYPESENSE_HOST", "localhost")
 	tsPort   := getEnv("TYPESENSE_PORT", "8108")
 
+	// Omit the port from the base URL when it is the default for the protocol
+	// (https+443 or http+80). Render's edge proxy rejects an explicit :443 in
+	// the Host header, causing a TLS timeout even though the server is up.
+	var tsBase string
+	if (protocol == "https" && tsPort == "443") || (protocol == "http" && tsPort == "80") {
+		tsBase = fmt.Sprintf("%s://%s", protocol, tsHost)
+	} else {
+		tsBase = fmt.Sprintf("%s://%s:%s", protocol, tsHost, tsPort)
+	}
 
 	return config{
 		postgresDSN:     dsn,
-		typesenseBase:   fmt.Sprintf("%s://%s:%s", protocol, tsHost, tsPort),
+		typesenseBase:   tsBase,
 		typesenseAPIKey: getEnv("TYPESENSE_API_KEY", "typesense-dev-key"),
 		// Plain relative path — resolves from wherever the script is invoked.
 		// Override with: CSV_PATH=/absolute/path/to/file.csv go run scripts/ingest/main.go
@@ -147,6 +156,143 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Typesense document selection: priority-first, hard-capped at tsIndexLimit
+// ─────────────────────────────────────────────────────────────────────────────
+
+// tsIndexLimit is the maximum number of documents pushed to Typesense.
+// Kept at 15,000 so the index fits comfortably within Render's free-tier
+// 512 MB RAM ceiling (~20 MB for 15k documents leaves ample headroom).
+const tsIndexLimit = 15_000
+
+// priorityKeywords contains lowercase substrings matched against village_name.
+// Any document whose village_name contains one of these keywords is guaranteed
+// a slot in the first part of the Typesense batch before fill records are added.
+var priorityKeywords = []string{
+	// ── Pune / Maharashtra IT corridors ──────────────────────────────────────
+	"hinjavadi", // Hinjewadi Phase I/II/III IT park (census: Hinjavadi)
+	"wakad",
+	"baner",
+	"kharadi",
+	"hadapsar",
+	"kothrud",
+	"viman nagar",
+	"magarpatta",
+	"pimpri",
+	"chinchwad",
+	// ── Bengaluru / Karnataka ─────────────────────────────────────────────────
+	"koramangala",
+	"yelahanka",
+	"yalahanka", // census spelling of Yelahanka
+	"whitefield",
+	"marathahalli",
+	"indiranagar",
+	"sarjapur",
+	"electronic city",
+	"bellandur",
+	"hebbal",
+	// ── Mumbai / Thane / Navi Mumbai ─────────────────────────────────────────
+	"andheri",
+	"bandra",
+	"powai",
+	"kurla",
+	"thane",
+	"vashi",
+	"belapur",
+	// ── Hyderabad / Telangana-adjacent Andhra Pradesh ─────────────────────────
+	"hitech city",
+	"madhapur",
+	"gachibowli",
+	"kondapur",
+	"kukatpally",
+	"miyapur",
+	// ── Chennai / Tamil Nadu ──────────────────────────────────────────────────
+	"sholinganallur",
+	"perungudi",
+	"ambattur",
+	"porur",
+	// ── Delhi / NCR ───────────────────────────────────────────────────────────
+	"dwarka",
+	"rohini",
+	"gurugram",
+	"noida",
+	"gurgaon",
+	// ── Other well-known cities represented in the dataset ────────────────────
+	"bangalore",
+	"bengaluru",
+	"mumbai",
+	"delhi",
+	"kolkata",
+	"chennai",
+	"jaipur",
+	"lucknow",
+	"patna",
+	"bhubaneswar",
+	"indore",
+	"bhopal",
+	"surat",
+	"ahmedabad",
+	"vadodara",
+	"chandigarh",
+}
+
+// prioritizeAndLimit selects up to `limit` VillageDocs for Typesense indexing.
+//
+// Selection order:
+//  1. Priority docs — any village whose name (lowercase) contains one of the
+//     priorityKeywords. These are guaranteed to be included first.
+//  2. Fill docs    — the remaining villages in CSV order, appended until the
+//     total reaches `limit`.
+//
+// This ensures demo-critical locations are always present regardless of which
+// slice of the 564k corpus the fill picks up.
+func prioritizeAndLimit(docs []VillageDoc, limit int) []VillageDoc {
+	if len(docs) <= limit {
+		return docs // nothing to trim
+	}
+
+	priority := make([]VillageDoc, 0, 512)
+	fill := make([]VillageDoc, 0, limit)
+
+	prioritySeen := make(map[string]bool, 512)
+
+	for _, d := range docs {
+		lower := strings.ToLower(d.VillageName)
+		matched := false
+		for _, kw := range priorityKeywords {
+			if strings.Contains(lower, kw) {
+				matched = true
+				break
+			}
+		}
+		if matched && !prioritySeen[d.ID] {
+			prioritySeen[d.ID] = true
+			priority = append(priority, d)
+		} else if !matched {
+			fill = append(fill, d)
+		}
+	}
+
+	// Cap priority slice itself if it somehow exceeds the limit
+	if len(priority) > limit {
+		priority = priority[:limit]
+	}
+
+	// Fill remaining slots
+	remaining := limit - len(priority)
+	if remaining > 0 && len(fill) > 0 {
+		if remaining < len(fill) {
+			fill = fill[:remaining]
+		}
+		priority = append(priority, fill...)
+	}
+
+	log.Printf("[limit] Typesense batch: %d priority + %d fill = %d / %d total docs",
+		len(priority)-len(fill), len(fill), len(priority), len(docs))
+
+	return priority
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -180,11 +326,18 @@ func main() {
 		log.Fatalf("FATAL: hierarchy ingest failed: %v", err)
 	}
 
-	// 4. Bulk-load villages (TRUNCATE + COPY)
+	// 4. Bulk-load villages into Postgres (TRUNCATE + COPY — full 564k dataset)
 	docs, err := ingestVillages(db, rows, subDistMap)
 	if err != nil {
 		log.Fatalf("FATAL: village ingest failed: %v", err)
 	}
+
+	// 4b. Cap the Typesense batch to tsIndexLimit to avoid OOM on the free-tier
+	//     512 MB Render instance. Priority villages (Hinjewadi, Koramangala,
+	//     Yelahanka, etc.) are guaranteed slots before fill records are added.
+	tsDocs := prioritizeAndLimit(docs, tsIndexLimit)
+	log.Printf("[limit] Typesense will index %d of %d total villages (cap=%d)",
+		len(tsDocs), len(docs), tsIndexLimit)
 
 	// 5. Typesense — ping, recreate collection, bulk index
 	if err := pingTypesense(cfg.typesenseBase, cfg.typesenseAPIKey); err != nil {
@@ -193,7 +346,7 @@ func main() {
 	if err := recreateTypesenseCollection(cfg.typesenseBase, cfg.typesenseAPIKey); err != nil {
 		log.Fatalf("FATAL: Typesense collection setup failed: %v", err)
 	}
-	if err := indexTypesense(cfg.typesenseBase, cfg.typesenseAPIKey, docs); err != nil {
+	if err := indexTypesense(cfg.typesenseBase, cfg.typesenseAPIKey, tsDocs); err != nil {
 		log.Fatalf("FATAL: Typesense indexing failed: %v", err)
 	}
 

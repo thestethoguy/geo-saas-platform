@@ -126,7 +126,16 @@ func buildTypesenseConfig() (serverURL string, apiKey string) {
 		port = "8108"
 	}
 
-	built := fmt.Sprintf("%s://%s:%s", protocol, host, port)
+	// Omit the port when it is the protocol default (https+443, http+80).
+	// Render's edge proxy rejects an explicit :443 in the Host header, causing
+	// the Health() TLS handshake to time out and searchClient to be left nil,
+	// which makes every /search request return 503 before reaching Typesense.
+	var built string
+	if (protocol == "https" && port == "443") || (protocol == "http" && port == "80") {
+		built = fmt.Sprintf("%s://%s", protocol, host)
+	} else {
+		built = fmt.Sprintf("%s://%s:%s", protocol, host, port)
+	}
 	log.Printf("[config] Typesense: protocol=%q host=%q port=%q → %s", protocol, host, port, built)
 	return built, apiKey
 }

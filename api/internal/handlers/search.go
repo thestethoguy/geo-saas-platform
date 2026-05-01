@@ -66,8 +66,12 @@ type SearchResponse struct {
 // serves sub-millisecond responses; adding a Redis layer would slow down
 // multi-term prefix searches that change on every keystroke.
 func (h *SearchHandler) Search(w http.ResponseWriter, r *http.Request) {
-	// ── 0. Guard: Typesense may be unavailable at startup ─────────────────
+	// ── 0. Guard: Typesense client is nil when startup connectivity failed ──
 	if h.ts == nil {
+		// This fires when NewTypesenseClient() failed at boot (Health() timeout).
+		// The real upstream error was already logged in cmd/main.go at startup;
+		// repeat it here so every failing request is traceable in Render logs.
+		log.Printf("[search] ERROR: Typesense client is nil — search unavailable. Check startup logs for the root cause (likely: URL construction or API key issue).")
 		writeError(w, http.StatusServiceUnavailable, "search service is currently unavailable — please try again later")
 		return
 	}
@@ -117,7 +121,9 @@ func (h *SearchHandler) Search(w http.ResponseWriter, r *http.Request) {
 	// ── 3. Execute search against Typesense ──────────────────────────────
 	result, err := h.ts.TS().Collection(tsCollection).Documents().Search(r.Context(), params)
 	if err != nil {
-		log.Printf("[search] typesense error: %v", err)
+		// Log the full raw error so it appears in Render's log stream.
+		// This is the primary diagnostic line for upstream Typesense failures.
+		log.Printf("[search] TYPESENSE RAW ERROR: %v", err)
 		writeError(w, http.StatusBadGateway, "search service unavailable")
 		return
 	}
