@@ -43,14 +43,15 @@ func main() {
 	defer redisClient.Close()
 
 	// ── 4. Connect to Typesense ───────────────────────────────────────────
+	// NewTypesenseClient always returns a usable client even if the startup
+	// health probe fails (e.g. transient 429 / cold-start block). Errors here
+	// indicate structural issues (bad URL, missing key) but do not nil the client.
 	searchClient, err := search.NewTypesenseClient(
 		cfg.TypesenseURL(),
 		cfg.TypesenseAPIKey,
 	)
 	if err != nil {
-		// Non-fatal: the geo-hierarchy endpoints don't need Typesense.
-		// /api/v1/search will return 503 until connectivity is restored.
-		log.Printf("[main] WARN: Typesense unavailable (%v) — search endpoint will return 503", err)
+		log.Printf("[main] WARN: Typesense client init error (%v) — search may degrade", err)
 	}
 
 	// ── 5. Instantiate handlers ───────────────────────────────────────────

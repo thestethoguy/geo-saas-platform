@@ -5,7 +5,6 @@ package search
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -28,17 +27,26 @@ func NewTypesenseClient(serverURL, apiKey string) (*Client, error) {
 		typesense.WithNumRetries(2),
 	)
 
-	// Verify connectivity — Health() performs a GET /health.
-	// Signature: Health(ctx context.Context, timeout time.Duration) (bool, error)
-	healthy, err := ts.Health(context.Background(), 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("typesense health check: %w", err)
-	}
-	if !healthy {
-		return nil, fmt.Errorf("typesense reported unhealthy status")
+	// Probe connectivity with a best-effort Health() check.
+	//
+	// ⚠  We intentionally do NOT treat a failed probe as fatal.
+	//    Transient errors (429 DDoS-protection blocks, cold-start timeouts,
+	//    brief network blips) must not permanently nil the client for the
+	//    entire process lifetime.  The client is fully usable regardless of
+	//    whether this probe succeeds — it will auto-recover once the block
+	//    expires without requiring a redeploy.
+	healthy, err := ts.Health(context.Background(), 10*time.Second)
+	switch {
+	case err != nil:
+		log.Printf("[search] WARN: Typesense health probe failed (%v) — "+
+			"returning client anyway; will retry on first request", err)
+	case !healthy:
+		log.Printf("[search] WARN: Typesense reported unhealthy status — "+
+			"returning client anyway; may be a transient 429 / cold-start")
+	default:
+		log.Println("[search] Typesense connection established ✓")
 	}
 
-	log.Println("[search] Typesense connection established ✓")
 	return &Client{ts: ts}, nil
 }
 
